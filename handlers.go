@@ -1,12 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"os/exec"
-	"strings"
+
+	"golang.org/x/crypto/ssh"
 )
 
 // Handler para gerar VPN e executar o script
@@ -24,99 +25,161 @@ func generateVPNAndExecuteScript(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	usuario := fmt.Sprintf("usuario@%s", req.ServerIP)
-	senha := fmt.Sprintf("echo %s", req.Password)
+	fmt.Print(req.Clients)
+	endereco := fmt.Sprintf("%s:%s", req.ServerIP, req.ServerPort)
+
+	config := &ssh.ClientConfig{
+		User: "root",
+		Auth: []ssh.AuthMethod{
+			ssh.Password(req.Password),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+
+	// Conecta ao servidor
+	client, err := ssh.Dial("tcp", endereco, config)
+	if err != nil {
+		log.Fatalf("Falha ao conectar: %s", err)
+	}
+	defer client.Close()
+
+	// Cria uma nova sessão SSH
+	session, err := client.NewSession()
+	if err != nil {
+		log.Fatalf("Falha ao criar sessão: %s", err)
+	}
+	defer session.Close()
+
+	// Captura stdout e stderr
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
+	session.Stdout = &stdoutBuf
+	session.Stderr = &stderrBuf
+
 	// Prepara o comando SSH
-	cmd := exec.Command("sshpass", "-p", senha,
-	"ssh", usuario,
-	"-o", "StrictHostKeyChecking=no",
-	"sudo", "bash", "-c",
-		fmt.Sprintf(`	
-			export CLIENTS="%s"
-			export SERVER_IP="%s"
-			export SERVER_PORT="%s"
+	cmd := fmt.Sprintf(`
 
-			cat > /tmp/generate_vpn.sh << 'EOF'
-			#!/bin/bash
+export CLIENTS="%s"
+export SERVER_IP="%s"
+export SERVER_PORT="%s"
 
-			if [ "$EUID" -ne 0 ]; then
-				echo "Por favor, execute como root"
-				exit 1
-			fi
+cat > /tmp/generate_vpn.sh << 'EOF'
+#!/bin/bash
 
-			EASYRSA_DIR="/usr/share/easy-rsa"
-			OUTPUT_DIR="/home/$(logname)"
-			VPN_BASE_DIR="/etc/openvpn/client"
+set -e  # Sai imediatamente se algum comando falhar
 
-			mkdir -p "$VPN_BASE_DIR"
-			mkdir -p "$OUTPUT_DIR"
+CLIENTS="$CLIENTS"
+EASYRSA_DIR="/usr/share/easy-rsa"
+OUTPUT_DIR="/home/$CLIENTS"
+VPN_BASE_DIR="/etc/openvpn/client"
 
-			IFS=',' read -r -a CLIENTES <<< "$CLIENTS"
-			SERVER_IP="$SERVER_IP"
-			SERVER_PORT="$SERVER_PORT"
+# Verificar se easyrsa está instalado
+if [ ! -f "$EASYRSA_DIR/easyrsa" ]; then
+    echo "Erro: easyrsa não encontrado em $EASYRSA_DIR" >&2
+    exit 1
+fi
 
-			for CLIENTE in "${CLIENTES[@]}"; do
-				echo "=============================="
-				echo "Gerando VPN para: $CLIENTE"
-				echo "=============================="
+sudo mkdir -p "$VPN_BASE_DIR"
+sudo mkdir -p "$OUTPUT_DIR"
 
-				cd "$EASYRSA_DIR" || exit 1
-				./easyrsa gen-req "$CLIENTE" nopass
-				echo "yes" | ./easyrsa sign-req client "$CLIENTE"
+SERVER_IP="$SERVER_IP"
+SERVER_PORT="$SERVER_PORT"
 
-				CLIENT_DIR="$VPN_BASE_DIR/$CLIENTE"
-				mkdir -p "$CLIENT_DIR"
+# Validar entrada
+if [ -z "$CLIENTS" ]; then
+    echo "Erro: Nome do cliente não especificado - $CLIENTS" >&2
+    exit 1
+fi
 
-				cp pki/ca.crt "$CLIENT_DIR/"
-				cp "pki/issued/$CLIENTE.crt" "$CLIENT_DIR/"
-				cp "pki/private/$CLIENTE.key" "$CLIENT_DIR/"
-				cp pki/dh.pem "$CLIENT_DIR/" 2>/dev/null || echo "Arquivo dh.pem não encontrado (opcional)"
+if [ -z "$SERVER_IP" ]; then
+    echo "Erro: IP do servidor não especificado" >&2
+    exit 1
+fi
 
-				cat <<EOCONF > "$CLIENT_DIR/$CLIENTE.ovpn"
-				client
-				dev tun
-				proto udp
-				remote $SERVER_IP $SERVER_PORT
-				ca ca.crt
-				cert $CLIENTE.crt
-				key $CLIENTE.key
-				tls-client
-				resolv-retry infinite
-				nobind
-				persist-key
-				persist-tun
-				EOCONF
+echo "=============================="
+echo "Gerando VPN para: $CLIENTS"
+echo "=============================="
 
-				OUTPUT_CLIENT_DIR="$OUTPUT_DIR/$CLIENTE"
-				cp -r "$CLIENT_DIR" "$OUTPUT_CLIENT_DIR"
-				chown -R $(logname):$(logname) "$OUTPUT_CLIENT_DIR"
+cd "$EASYRSA_DIR" || exit 1
 
-				cd "$OUTPUT_DIR" || exit 1
-				zip -r "${CLIENTE}.zip" "$CLIENTE"
-				rm -rf "$OUTPUT_CLIENT_DIR"
+# Inicializar PKI se necessário
+if [ ! -d "pki" ]; then
+    ./easyrsa init-pki
+    ./easyrsa build-ca nopass
+    ./easyrsa gen-dh
+fi
 
-				echo "VPN para $CLIENTE gerada em $OUTPUT_DIR/${CLIENTE}.zip"
-			done
+# Gerar certificados (suprimindo saída interativa)
+{
+    echo "Gerando certificado para $CLIENTS..."
+    ./easyrsa --batch gen-req "$CLIENTS" nopass
+    echo "yes" | ./easyrsa --batch sign-req client "$CLIENTS"
+} || {
+    echo "Erro ao gerar certificados" >&2
+    exit 1
+}
 
-			echo "Processo concluído para todos os clientes."
-			EOF
+CLIENT_DIR="$VPN_BASE_DIR/$CLIENTS"
+sudo mkdir -p "$CLIENT_DIR"
 
-			chmod +x /tmp/generate_vpn.sh
-			sudo /tmp/generate_vpn.sh
-			rm -f /tmp/generate_vpn.sh
-		`,
-			strings.Join(req.Clients, ","),
-			req.ServerIP,
-			req.ServerPort,
-		),
-	)
+# Copiar arquivos com verificação
+sudo cp pki/ca.crt "$CLIENT_DIR/" || { echo "Erro ao copiar ca.crt" >&2; exit 1; }
+sudo cp "pki/issued/$CLIENTS.crt" "$CLIENT_DIR/" || { echo "Erro ao copiar $CLIENTS.crt" >&2; exit 1; }
+sudo cp "pki/private/$CLIENTS.key" "$CLIENT_DIR/" || { echo "Erro ao copiar $CLIENTS.key" >&2; exit 1; }
+sudo cp pki/dh.pem "$CLIENT_DIR/" 2>/dev/null || echo "Arquivo dh.pem não encontrado (opcional)"
+
+# Criar arquivo de configuração OVPN
+sudo bash -c "cat > '$CLIENT_DIR/$CLIENTS.ovpn'" <<EOCONF
+client
+dev tun
+proto udp
+remote $SERVER_IP $SERVER_PORT
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-256-CBC
+verb 3
+<ca>
+$(cat pki/ca.crt)
+</ca>
+<cert>
+$(cat pki/issued/$CLIENTS.crt)
+</cert>
+<key>
+$(cat pki/private/$CLIENTS.key)
+</key>
+EOCONF
+
+# Preparar arquivos para download
+OUTPUT_CLIENT_DIR="$OUTPUT_DIR/$CLIENTS"
+sudo mkdir -p "$OUTPUT_CLIENT_DIR"
+sudo cp -r "$CLIENT_DIR" "$(dirname "$OUTPUT_CLIENT_DIR")"
+sudo chown -R $(logname):$(logname) "$OUTPUT_CLIENT_DIR"
+
+# Compactar e limpar
+cd "$OUTPUT_DIR" || exit 1
+zip -r "${CLIENTS}.zip" "$CLIENTS" || { echo "Erro ao compactar arquivos" >&2; exit 1; }
+sudo rm -rf "$OUTPUT_CLIENT_DIR"
+
+echo "VPN para $CLIENTS gerada com sucesso em:"
+echo "$OUTPUT_DIR/${CLIENTS}.zip"
+EOF
+
+sudo chmod +x /tmp/generate_vpn.sh
+sudo /tmp/generate_vpn.sh || { echo "Falha na execução do script" >&2; exit 1; }
+sudo rm -f /tmp/generate_vpn.sh
+`,
+    req.Clients,
+    req.ServerIP,
+    req.ServerPort,
+)
 
 	// Executa o comando
-	output, err := cmd.CombinedOutput()
-	
+	err = session.Run(cmd)
 	if err != nil {
-		log.Printf("Erro ao executar o comando: %v\nSaída: %s", err, string(output))
-		http.Error(w, fmt.Sprintf("Erro ao executar o script na VM: %v\nSaída: %s", err, string(output)), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Erro na execução remota: %s\nDetalhes: %s", err, stderrBuf.String()), http.StatusInternalServerError)
 		return
 	}
 

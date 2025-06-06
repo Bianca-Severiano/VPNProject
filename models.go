@@ -2,7 +2,7 @@ package main
 
 // VPNRequest representa a estrutura da requisição para gerar certificados VPN
 type VPNRequest struct {
-	Clients    []string `json:"clients" binding:"required"`
+	Clients    string `json:"clients" binding:"required"`
 	ServerIP   string   `json:"server_ip" binding:"required"`
 	ServerPort string   `json:"server_port" binding:"required"`
 	Password string `json:"password" binding:"required"`
@@ -11,5 +11,5 @@ type VPNRequest struct {
 // VPNResponse representa a resposta da API
 type VPNResponse struct {
 	Message string   `json:"message"`
-	Clients []string `json:"clients"`
+	Clients string `json:"clients"`
 }
