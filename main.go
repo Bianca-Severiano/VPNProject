@@ -2,25 +2,27 @@ package main
 
 import (
 	"log"
+	"net/http"
 	"os"
 
-	"github.com/gin-gonic/gin"
+	"github.com/go-chi/chi"
 )
 
 func main() {
-	r := gin.Default()
+	r := chi.NewRouter()
 
-	// Configuração das rotas
-	r.POST("/generate-vpn", generateVPNAndExecuteScript)
+	// Rotas
+	r.Post("/generate-vpn", generateVPNAndExecuteScript)
 
-	// Inicia o servidor na porta 8080
+	// Inicia o servidor na porta configurada
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
 	log.Printf("Servidor rodando na porta %s", port)
-	if err := r.Run(":" + port); err != nil {
+	err := http.ListenAndServe(":"+port, r)
+	if err != nil {
 		log.Fatalf("Erro ao iniciar o servidor: %v", err)
 	}
 }

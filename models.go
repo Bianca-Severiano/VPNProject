@@ -5,6 +5,7 @@ type VPNRequest struct {
 	Clients    []string `json:"clients" binding:"required"`
 	ServerIP   string   `json:"server_ip" binding:"required"`
 	ServerPort string   `json:"server_port" binding:"required"`
+	Password string `json:"password" binding:"required"`
 }
 
 // VPNResponse representa a resposta da API
